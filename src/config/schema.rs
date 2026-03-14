@@ -1413,6 +1413,18 @@ pub struct HttpRequestConfig {
     /// Request timeout in seconds (default: 30)
     #[serde(default = "default_http_timeout_secs")]
     pub timeout_secs: u64,
+    /// Ports that are allowed for private/local IP addresses.
+    ///
+    /// By default private hosts (192.168.x.x, 10.x.x.x, localhost, etc.) are
+    /// always blocked.  Setting this list opens a narrow exception: a request
+    /// to a private host is permitted **only** when the URL explicitly specifies
+    /// one of these port numbers.  The host must still appear in
+    /// `allowed_domains`.  Empty list (default) = private hosts remain fully
+    /// blocked.
+    ///
+    /// Example: `private_allowed_ports = [8080, 9000]`
+    #[serde(default)]
+    pub private_allowed_ports: Vec<u16>,
 }
 
 impl Default for HttpRequestConfig {
@@ -1422,6 +1434,7 @@ impl Default for HttpRequestConfig {
             allowed_domains: vec![],
             max_response_size: default_http_max_response_size(),
             timeout_secs: default_http_timeout_secs(),
+            private_allowed_ports: vec![],
         }
     }
 }

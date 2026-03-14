@@ -12,6 +12,7 @@ pub struct HttpRequestTool {
     allowed_domains: Vec<String>,
     max_response_size: usize,
     timeout_secs: u64,
+    private_allowed_ports: Vec<u16>,
 }
 
 impl HttpRequestTool {
@@ -20,12 +21,14 @@ impl HttpRequestTool {
         allowed_domains: Vec<String>,
         max_response_size: usize,
         timeout_secs: u64,
+        private_allowed_ports: Vec<u16>,
     ) -> Self {
         Self {
             security,
             allowed_domains: normalize_allowed_domains(allowed_domains),
             max_response_size,
             timeout_secs,
+            private_allowed_ports,
         }
     }
 
@@ -53,7 +56,18 @@ impl HttpRequestTool {
         let host = extract_host(url)?;
 
         if is_private_or_local_host(&host) {
-            anyhow::bail!("Blocked local/private host: {host}");
+            let port = extract_port(url);
+            match port {
+                Some(p) if self.private_allowed_ports.contains(&p) => {
+                    // Private host is allowed on this specific port — fall through to allowlist check.
+                }
+                Some(p) => anyhow::bail!(
+                    "Blocked local/private host: {host} (port {p} is not in http_request.private_allowed_ports)"
+                ),
+                None => anyhow::bail!(
+                    "Blocked local/private host: {host} (no port specified; add the port to http_request.private_allowed_ports to allow private hosts)"
+                ),
+            }
         }
 
         if !host_matches_allowlist(&host, &self.allowed_domains) {
@@ -342,6 +356,26 @@ fn normalize_domain(raw: &str) -> Option<String> {
     Some(d)
 }
 
+/// Extract the explicit port number from a URL, if present.
+/// Returns `None` if no port is specified (implicit 80/443).
+fn extract_port(url: &str) -> Option<u16> {
+    let rest = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))?;
+
+    // authority = everything before the first '/', '?', or '#'
+    let authority = rest.split(['/', '?', '#']).next()?;
+
+    // Strip IPv6 bracket notation — not supported but guard anyway
+    if authority.starts_with('[') {
+        return None;
+    }
+
+    // host:port — take the part after the last ':'
+    let port_str = authority.split(':').last()?;
+    port_str.parse::<u16>().ok()
+}
+
 fn extract_host(url: &str) -> anyhow::Result<String> {
     let rest = url
         .strip_prefix("http://")
@@ -454,6 +488,13 @@ mod tests {
     use crate::security::{AutonomyLevel, SecurityPolicy};
 
     fn test_tool(allowed_domains: Vec<&str>) -> HttpRequestTool {
+        test_tool_with_private_ports(allowed_domains, vec![])
+    }
+
+    fn test_tool_with_private_ports(
+        allowed_domains: Vec<&str>,
+        private_allowed_ports: Vec<u16>,
+    ) -> HttpRequestTool {
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
             ..SecurityPolicy::default()
@@ -463,6 +504,7 @@ mod tests {
             allowed_domains.into_iter().map(String::from).collect(),
             1_000_000,
             30,
+            private_allowed_ports,
         )
     }
 
@@ -570,7 +612,7 @@ mod tests {
     #[test]
     fn validate_requires_allowlist() {
         let security = Arc::new(SecurityPolicy::default());
-        let tool = HttpRequestTool::new(security, vec![], 1_000_000, 30);
+        let tool = HttpRequestTool::new(security, vec![], 1_000_000, 30, vec![]);
         let err = tool
             .validate_url("https://example.com")
             .unwrap_err()
@@ -686,7 +728,7 @@ mod tests {
             autonomy: AutonomyLevel::ReadOnly,
             ..SecurityPolicy::default()
         });
-        let tool = HttpRequestTool::new(security, vec!["example.com".into()], 1_000_000, 30);
+        let tool = HttpRequestTool::new(security, vec!["example.com".into()], 1_000_000, 30, vec![]);
         let result = tool
             .execute(json!({"url": "https://example.com"}))
             .await
@@ -701,7 +743,7 @@ mod tests {
             max_actions_per_hour: 0,
             ..SecurityPolicy::default()
         });
-        let tool = HttpRequestTool::new(security, vec!["example.com".into()], 1_000_000, 30);
+        let tool = HttpRequestTool::new(security, vec!["example.com".into()], 1_000_000, 30, vec![]);
         let result = tool
             .execute(json!({"url": "https://example.com"}))
             .await
@@ -724,6 +766,7 @@ mod tests {
             vec!["example.com".into()],
             10,
             30,
+            vec![],
         );
         let text = "hello world this is long";
         let truncated = tool.truncate_response(text);
@@ -738,6 +781,7 @@ mod tests {
             vec!["example.com".into()],
             0, // max_response_size = 0 means no limit
             30,
+            vec![],
         );
         let text = "a".repeat(10_000_000);
         assert_eq!(tool.truncate_response(&text), text);
@@ -750,6 +794,7 @@ mod tests {
             vec!["example.com".into()],
             5,
             30,
+            vec![],
         );
         let text = "hello world";
         let truncated = tool.truncate_response(text);
@@ -934,5 +979,72 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("IPv6"));
+    }
+
+    // ── private_allowed_ports tests ──────────────────────────────
+
+    #[test]
+    fn private_host_allowed_on_permitted_port() {
+        let tool = test_tool_with_private_ports(vec!["192.168.1.10"], vec![8080]);
+        assert!(tool.validate_url("http://192.168.1.10:8080/api").is_ok());
+    }
+
+    #[test]
+    fn private_host_blocked_on_non_permitted_port() {
+        let tool = test_tool_with_private_ports(vec!["192.168.1.10"], vec![8080]);
+        let err = tool
+            .validate_url("http://192.168.1.10:9999/api")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("9999") && err.contains("private_allowed_ports"));
+    }
+
+    #[test]
+    fn private_host_blocked_when_no_port_specified() {
+        let tool = test_tool_with_private_ports(vec!["192.168.1.10"], vec![8080]);
+        let err = tool
+            .validate_url("http://192.168.1.10/api")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no port") || err.contains("private_allowed_ports"));
+    }
+
+    #[test]
+    fn private_host_still_blocked_when_port_list_empty() {
+        let tool = test_tool_with_private_ports(vec!["192.168.1.10"], vec![]);
+        let err = tool
+            .validate_url("http://192.168.1.10:8080/api")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("private_allowed_ports"));
+    }
+
+    #[test]
+    fn localhost_allowed_on_permitted_port() {
+        let tool = test_tool_with_private_ports(vec!["localhost"], vec![3000]);
+        assert!(tool.validate_url("http://localhost:3000").is_ok());
+    }
+
+    #[test]
+    fn private_host_must_still_match_allowed_domains() {
+        // Port is allowed, but domain is NOT in allowed_domains → should fail allowlist check.
+        let tool = test_tool_with_private_ports(vec!["192.168.1.5"], vec![8080]);
+        let err = tool
+            .validate_url("http://192.168.1.99:8080/api")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("allowed_domains"));
+    }
+
+    #[test]
+    fn extract_port_parses_explicit_port() {
+        assert_eq!(extract_port("http://example.com:8080/path"), Some(8080));
+        assert_eq!(extract_port("https://192.168.1.1:9000"), Some(9000));
+    }
+
+    #[test]
+    fn extract_port_returns_none_when_no_port() {
+        assert_eq!(extract_port("http://example.com/path"), None);
+        assert_eq!(extract_port("https://example.com"), None);
     }
 }
